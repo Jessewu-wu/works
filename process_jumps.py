@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
+import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence, Tuple
-
-import math
 
 G = 9.80665  # gravitational acceleration (m/s^2)
 
@@ -315,23 +316,95 @@ def write_results(results: Sequence[JumpResult], output_path: Path) -> None:
             )
 
 
-def print_summary(results: Sequence[JumpResult]) -> None:
+def format_summary(results: Sequence[JumpResult]) -> str:
     if not results:
-        print("No jump files were processed.")
+        return "未找到可用的纵跳数据，请确认文件夹内包含 .txt 数据文件。"
+
+    lines: List[str] = []
+    for result in results:
+        lines.extend(
+            [
+                f"文件：{result.file.name}",
+                f"信号名称：{result.signal_name}",
+                f"体重估计：{result.body_weight:.2f} N (≈ {result.mass:.3f} kg)",
+                f"稳定区间：{result.stable_start_s:.3f}s – {result.stable_end_s:.3f}s",
+                f"动作起始：{result.movement_start_s:.3f}s",
+                f"起跳时刻：{result.takeoff_time_s:.3f}s",
+                f"落地时刻：{result.landing_time_s:.3f}s",
+                f"滞空时间：{result.flight_time_s:.3f}s",
+                f"起跳速度：{result.takeoff_velocity:.3f} m/s",
+                f"纵跳高度：{result.jump_height:.3f} m",
+                "",
+            ]
+        )
+
+    return "\n".join(lines).rstrip()
+
+
+def print_summary(results: Sequence[JumpResult]) -> None:
+    print(format_summary(results))
+
+
+def run_analysis(
+    directory: Path,
+    sample_rate: float,
+    output_path: Optional[Path] = None,
+) -> Tuple[Sequence[JumpResult], Optional[Path]]:
+    results = process_directory(directory, sample_rate)
+
+    if output_path is None:
+        output_path = directory / "jump_results.csv"
+
+    if results:
+        write_results(results, output_path)
+        return results, output_path
+
+    return results, None
+
+
+def can_use_gui() -> bool:
+    if os.environ.get("FORCE_CLI") == "1":
+        return False
+
+    if sys.platform.startswith("linux") and not os.environ.get("DISPLAY"):
+        return False
+
+    try:
+        import tkinter  # noqa: F401
+    except Exception:
+        return False
+
+    return True
+
+
+def run_gui() -> None:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox
+
+    root = tk.Tk()
+    root.withdraw()
+
+    directory = filedialog.askdirectory(title="请选择包含纵跳 TXT 文件的文件夹")
+    if not directory:
+        messagebox.showinfo("提示", "未选择文件夹，程序已退出。")
         return
 
-    for result in results:
-        print(f"\nFile: {result.file.name}")
-        print(f"Signal name: {result.signal_name}")
-        print(f"Estimated body weight: {result.body_weight:.2f} N")
-        print(f"Estimated mass: {result.mass:.3f} kg")
-        print(f"Stable phase: {result.stable_start_s:.3f}s – {result.stable_end_s:.3f}s")
-        print(f"Movement onset: {result.movement_start_s:.3f}s")
-        print(f"Take-off time: {result.takeoff_time_s:.3f}s")
-        print(f"Landing time: {result.landing_time_s:.3f}s")
-        print(f"Flight time: {result.flight_time_s:.3f}s")
-        print(f"Take-off velocity: {result.takeoff_velocity:.3f} m/s")
-        print(f"Jump height: {result.jump_height:.3f} m")
+    directory_path = Path(directory)
+    try:
+        results, saved_path = run_analysis(directory_path, sample_rate=600.0)
+        summary = format_summary(results)
+
+        if saved_path is not None:
+            summary += f"\n\n结果已保存至：{saved_path}"
+
+        messagebox.showinfo("纵跳分析结果", summary)
+    except Exception as exc:
+        messagebox.showerror("纵跳分析失败", str(exc))
+
+
+def should_use_gui(argv: Optional[Sequence[str]]) -> bool:
+    arguments = list(argv or [])
+    return not arguments and can_use_gui()
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -359,23 +432,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
-    args = parse_args(argv)
-    directory = args.directory
+    parsed_args = parse_args(argv)
+    directory = parsed_args.directory
     if not directory.exists():
         raise SystemExit(f"Directory not found: {directory}")
 
-    results = process_directory(directory, args.sample_rate)
+    results, saved_path = run_analysis(
+        directory, parsed_args.sample_rate, parsed_args.output
+    )
+
     print_summary(results)
 
-    if args.output is not None:
-        output_path = args.output
-    else:
-        output_path = directory / "jump_results.csv"
-
-    if results:
-        write_results(results, output_path)
-        print(f"\nSummary saved to {output_path}")
+    if saved_path is not None:
+        print(f"\nSummary saved to {saved_path}")
 
 
 if __name__ == "__main__":
-    main()
+    argv = sys.argv[1:]
+    if should_use_gui(argv):
+        run_gui()
+    else:
+        main(argv)
