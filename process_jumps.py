@@ -11,6 +11,7 @@ import argparse
 import csv
 import math
 import os
+import statistics
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -87,10 +88,11 @@ def read_force_signal(path: Path) -> Tuple[str, List[float]]:
 def find_stable_segment(
     forces: Sequence[float],
     sample_rate: float,
-    window_duration: float = 0.5,
-    cv_threshold: float = 0.015,
-    extend_ratio: float = 0.02,
+    window_duration: float = 0.25,
+    cv_threshold: float = 0.05,
+    extend_ratio: float = 0.04,
     extend_absolute: float = 15.0,
+    search_duration: float = 3.0,
 ) -> Tuple[float, int, int]:
     """Locate the initial quiet stance used to estimate body weight.
 
@@ -105,36 +107,72 @@ def find_stable_segment(
     if total_samples < window_size:
         raise JumpAnalysisError("Signal too short to locate a stable stance")
 
-    best_start: Optional[int] = None
-    best_cv = math.inf
-    weight_estimate: Optional[float] = None
+    search_samples = min(total_samples, int(round(search_duration * sample_rate)))
+    if search_samples < window_size:
+        search_samples = window_size
 
-    search_limit = total_samples - window_size + 1
-    for start in range(search_limit):
-        window = forces[start : start + window_size]
-        mean = sum(window) / window_size
-        if mean <= 0:
-            continue
-        variance = sum((value - mean) ** 2 for value in window) / window_size
-        std = math.sqrt(variance)
-        cv = std / mean if mean else math.inf
-        if cv < best_cv:
-            best_cv = cv
-            best_start = start
-            weight_estimate = mean
-        if cv <= cv_threshold:
-            # Accept the first low-variance window we encounter.
-            break
-
-    if best_start is None or weight_estimate is None:
+    initial_segment = forces[:search_samples]
+    if not initial_segment:
         raise JumpAnalysisError("Unable to determine stable stance")
 
+    median = statistics.median(initial_segment)
+    band = max(median * 0.08, extend_absolute * 2)
+    filtered = [value for value in initial_segment if abs(value - median) <= band]
+    if not filtered:
+        filtered = initial_segment
+    weight_estimate = statistics.fmean(filtered)
+
     tolerance = max(weight_estimate * extend_ratio, extend_absolute)
-    stable_end = best_start + window_size
-    while stable_end < total_samples and abs(forces[stable_end] - weight_estimate) <= tolerance:
+
+    running_sum = 0.0
+    running_sq_sum = 0.0
+    stable_start: Optional[int] = None
+    for idx in range(search_samples):
+        value = forces[idx]
+        running_sum += value
+        running_sq_sum += value * value
+        if idx >= window_size:
+            removed = forces[idx - window_size]
+            running_sum -= removed
+            running_sq_sum -= removed * removed
+        if idx + 1 < window_size:
+            continue
+        mean = running_sum / window_size
+        variance = max(running_sq_sum / window_size - mean * mean, 0.0)
+        std = math.sqrt(variance)
+        cv = std / mean if mean else math.inf
+        if abs(mean - weight_estimate) <= tolerance and cv <= cv_threshold:
+            stable_start = idx - window_size + 1
+            break
+
+    if stable_start is None:
+        stable_start = 0
+
+    stable_end = stable_start + window_size
+    cumulative_sum = sum(forces[stable_start:stable_end])
+    sample_count = window_size
+    deviation_limit = max(1, int(round(sample_rate * 0.02)))
+    out_of_bounds = 0
+    while stable_end < total_samples:
+        current_mean = cumulative_sum / sample_count if sample_count else weight_estimate
+        value = forces[stable_end]
+        if abs(value - current_mean) <= tolerance:
+            cumulative_sum += value
+            sample_count += 1
+            stable_end += 1
+            out_of_bounds = 0
+            continue
+
+        out_of_bounds += 1
+        if out_of_bounds >= deviation_limit:
+            break
+        cumulative_sum += value
+        sample_count += 1
         stable_end += 1
 
-    return weight_estimate, best_start, stable_end
+    refined_weight = cumulative_sum / sample_count if sample_count else weight_estimate
+
+    return refined_weight, stable_start, stable_end
 
 
 def find_movement_start(
