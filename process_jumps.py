@@ -252,8 +252,8 @@ def detect_jump_phases(forces: Sequence[float], sample_rate: float) -> JumpPhase
         weight,
         stable_end,
         sample_rate,
-        deviation_ratio=0.05,
-        absolute_threshold=20.0,
+        deviation_ratio=0.03,
+        absolute_threshold=12.0,
     )
 
     takeoff = find_takeoff(
