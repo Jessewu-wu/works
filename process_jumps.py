@@ -92,12 +92,12 @@ def find_stable_segment(
     std_absolute: float = 8.0,
     extend_ratio: float = 0.04,
     extend_absolute: float = 15.0,
-    search_duration: float = 0.3,
+    search_duration: float = 0.1,
 ) -> Tuple[float, int, int]:
     """Locate the initial quiet stance used to estimate body weight.
 
-    The function searches the first 0.3 seconds of data for the earliest
-    low-variance window that lasts at least 0.2 seconds, then extends it while
+    The function scans the first 0.1 seconds of data for the lowest-variance
+    window that lasts at least 0.2 seconds, then extends it while
     the force stays close to the estimated body weight.  The returned
     ``stable_end`` index is exclusive so it can be used directly as the start of
     the movement phase.
@@ -118,9 +118,10 @@ def find_stable_segment(
     if not baseline_segment:
         raise JumpAnalysisError("Unable to determine stable stance")
 
-    baseline_mean = statistics.fmean(baseline_segment)
+    baseline_center = statistics.median(baseline_segment)
 
     best_start: Optional[int] = None
+    best_variance: float = float("inf")
     running_sum = sum(forces[:window_size])
     running_sq_sum = sum(value * value for value in forces[:window_size])
     for start in range(0, search_samples - window_size + 1):
@@ -129,9 +130,11 @@ def find_stable_segment(
         std_threshold = max(std_threshold, 0.5)
         variance_threshold = std_threshold * std_threshold
         variance = max(running_sq_sum / window_size - mean * mean, 0.0)
-        if variance <= variance_threshold:
+        if variance <= variance_threshold and (
+            best_start is None or variance < best_variance
+        ):
             best_start = start
-            break
+            best_variance = variance
         if start + window_size >= search_samples:
             continue
         outgoing = forces[start]
@@ -144,16 +147,19 @@ def find_stable_segment(
 
     stable_start = best_start
     stable_end = stable_start + window_size
-    cumulative_sum = sum(forces[stable_start:stable_end])
+    window_samples = list(forces[stable_start:stable_end])
     sample_count = window_size
     deviation_limit = max(1, int(round(sample_rate * 0.02)))
     out_of_bounds = 0
     while stable_end < total_samples:
-        current_mean = cumulative_sum / sample_count if sample_count else baseline_mean
-        tolerance = max(current_mean * extend_ratio, extend_absolute)
+        if sample_count:
+            current_center = statistics.median(window_samples)
+        else:
+            current_center = baseline_center
+        tolerance = max(abs(current_center) * extend_ratio, extend_absolute)
         value = forces[stable_end]
-        if abs(value - current_mean) <= tolerance:
-            cumulative_sum += value
+        if abs(value - current_center) <= tolerance:
+            window_samples.append(value)
             sample_count += 1
             stable_end += 1
             out_of_bounds = 0
@@ -162,11 +168,13 @@ def find_stable_segment(
         out_of_bounds += 1
         if out_of_bounds >= deviation_limit:
             break
-        cumulative_sum += value
+        window_samples.append(value)
         sample_count += 1
         stable_end += 1
 
-    refined_weight = cumulative_sum / sample_count if sample_count else baseline_mean
+    refined_weight = (
+        statistics.median(window_samples) if sample_count else baseline_center
+    )
 
     return refined_weight, stable_start, stable_end
 
