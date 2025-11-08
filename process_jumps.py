@@ -88,93 +88,75 @@ def find_stable_segment(
     forces: Sequence[float],
     sample_rate: float,
     min_duration: float = 0.2,
-    std_ratio: float = 0.025,
-    std_absolute: float = 8.0,
-    extend_ratio: float = 0.04,
-    extend_absolute: float = 15.0,
     search_duration: float = 0.1,
+    window_samples: int = 20,
+    stable_diff: float = 5.0,
+    change_diff: float = 10.0,
 ) -> Tuple[float, int, int]:
     """Locate the initial quiet stance used to estimate body weight.
 
-    The function scans the first 0.1 seconds of data for the lowest-variance
-    window that lasts at least 0.2 seconds, then extends it while
-    the force stays close to the estimated body weight.  The returned
-    ``stable_end`` index is exclusive so it can be used directly as the start of
-    the movement phase.
+    A sliding-window scan compares the mean force of back-to-back windows. If
+    the absolute difference between the windows remains below ``stable_diff``
+    (≈5 N), the samples are considered part of the quiet stance. When the
+    difference exceeds ``change_diff`` (≈10 N), the stance phase ends. The
+    returned ``stable_end`` index is exclusive, allowing it to serve directly as
+    the boundary before movement onset.
     """
 
-    window_size = max(1, int(round(min_duration * sample_rate)))
     total_samples = len(forces)
-    if total_samples < window_size:
+    if total_samples == 0:
         raise JumpAnalysisError("Signal too short to locate a stable stance")
 
+    window_size = max(1, window_samples)
+    min_samples = max(window_size, int(round(min_duration * sample_rate)))
     search_samples = min(
-        total_samples, max(window_size, int(round(search_duration * sample_rate)))
+        total_samples, max(2 * window_size, int(round(search_duration * sample_rate)))
     )
-    if search_samples < window_size:
-        search_samples = window_size
+    if search_samples < 2 * window_size:
+        raise JumpAnalysisError("Not enough data for sliding window comparison")
 
-    baseline_segment = forces[:search_samples]
-    if not baseline_segment:
-        raise JumpAnalysisError("Unable to determine stable stance")
+    prefix = [0.0]
+    for value in forces:
+        prefix.append(prefix[-1] + value)
 
-    baseline_center = statistics.median(baseline_segment)
+    def window_mean(start: int) -> float:
+        end = start + window_size
+        return (prefix[end] - prefix[start]) / window_size
 
-    best_start: Optional[int] = None
-    best_variance: float = float("inf")
-    running_sum = sum(forces[:window_size])
-    running_sq_sum = sum(value * value for value in forces[:window_size])
-    for start in range(0, search_samples - window_size + 1):
-        mean = running_sum / window_size
-        std_threshold = max(std_ratio * abs(mean), std_absolute)
-        std_threshold = max(std_threshold, 0.5)
-        variance_threshold = std_threshold * std_threshold
-        variance = max(running_sq_sum / window_size - mean * mean, 0.0)
-        if variance <= variance_threshold and (
-            best_start is None or variance < best_variance
-        ):
-            best_start = start
-            best_variance = variance
-        if start + window_size >= search_samples:
-            continue
-        outgoing = forces[start]
-        incoming = forces[start + window_size]
-        running_sum += incoming - outgoing
-        running_sq_sum += incoming * incoming - outgoing * outgoing
+    stable_start: Optional[int] = None
+    for start in range(0, search_samples - 2 * window_size + 1):
+        mean1 = window_mean(start)
+        mean2 = window_mean(start + window_size)
+        if abs(mean2 - mean1) <= stable_diff:
+            stable_start = start
+            break
 
-    if best_start is None:
+    if stable_start is None:
         raise JumpAnalysisError("Unable to locate a stable stance window")
 
-    stable_start = best_start
+    stable_samples = list(forces[stable_start : stable_start + window_size])
     stable_end = stable_start + window_size
-    window_samples = list(forces[stable_start:stable_end])
-    sample_count = window_size
-    deviation_limit = max(1, int(round(sample_rate * 0.02)))
-    out_of_bounds = 0
-    while stable_end < total_samples:
-        if sample_count:
-            current_center = statistics.median(window_samples)
-        else:
-            current_center = baseline_center
-        tolerance = max(abs(current_center) * extend_ratio, extend_absolute)
-        value = forces[stable_end]
-        if abs(value - current_center) <= tolerance:
-            window_samples.append(value)
-            sample_count += 1
-            stable_end += 1
-            out_of_bounds = 0
+    current = stable_start
+
+    while current + 2 * window_size <= total_samples:
+        mean1 = window_mean(current)
+        next_start = current + window_size
+        mean2 = window_mean(next_start)
+        diff = abs(mean2 - mean1)
+
+        if diff <= change_diff:
+            stable_samples.extend(forces[next_start : next_start + window_size])
+            stable_end = next_start + window_size
+            current = next_start
             continue
 
-        out_of_bounds += 1
-        if out_of_bounds >= deviation_limit:
-            break
-        window_samples.append(value)
-        sample_count += 1
-        stable_end += 1
+        # diff > change_diff: stance has ended.
+        break
 
-    refined_weight = (
-        statistics.median(window_samples) if sample_count else baseline_center
-    )
+    if stable_end - stable_start < min_samples:
+        raise JumpAnalysisError("Stable stance shorter than minimum duration")
+
+    refined_weight = statistics.median(stable_samples)
 
     return refined_weight, stable_start, stable_end
 
