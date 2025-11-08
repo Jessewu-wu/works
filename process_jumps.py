@@ -123,11 +123,12 @@ def find_stable_segment(
     sample_rate: float,
     min_duration: float = 0.2,
     search_duration: float = 0.4,
+    max_stable_duration: float = 0.8,
     window_samples: int = 20,
-    rel_stable: float = 0.005,
-    rel_change: float = 0.015,
-    k_noise: float = 1.5,
-    k_change: float = 3.0,
+    rel_stable: float = 0.003,
+    rel_change: float = 0.006,
+    k_noise: float = 1.0,
+    k_change: float = 2.0,
 ) -> Tuple[float, int, int]:
     """Locate the initial quiet stance used to estimate body weight.
 
@@ -153,6 +154,10 @@ def find_stable_segment(
         raise JumpAnalysisError("Not enough data for sliding window comparison")
 
     baseline_segment = forces[:search_samples]
+    baseline_samples = max(window_size, int(round(min(0.2, search_duration) * sample_rate)))
+    baseline_core = forces[:baseline_samples]
+    if baseline_core:
+        baseline_segment = baseline_core
     baseline_mean = abs(robust_mean(baseline_segment)) or max(
         1.0, abs(statistics.fmean(baseline_segment))
     )
@@ -174,6 +179,7 @@ def find_stable_segment(
     best_start: Optional[int] = None
     best_end: Optional[int] = None
     best_length = 0
+    best_noise = float("inf")
     run_start: Optional[int] = None
     run_end: Optional[int] = None
 
@@ -189,9 +195,13 @@ def find_stable_segment(
         else:
             if run_start is not None and run_end is not None:
                 run_length = run_end - run_start
-                if run_length > best_length:
+                run_noise = robust_noise(forces[run_start:run_end])
+                if run_noise < best_noise or (
+                    abs(run_noise - best_noise) <= 1e-6 and run_length > best_length
+                ):
                     best_start, best_end = run_start, run_end
                     best_length = run_length
+                    best_noise = run_noise
             run_start = None
             run_end = None
             if diff >= change_threshold and best_start is not None:
@@ -199,9 +209,13 @@ def find_stable_segment(
 
     if run_start is not None and run_end is not None:
         run_length = run_end - run_start
-        if run_length > best_length:
+        run_noise = robust_noise(forces[run_start:run_end])
+        if run_noise < best_noise or (
+            abs(run_noise - best_noise) <= 1e-6 and run_length > best_length
+        ):
             best_start, best_end = run_start, run_end
             best_length = run_length
+            best_noise = run_noise
 
     if best_start is None or best_end is None:
         fallback_end = min(total_samples, max(min_samples, window_size))
@@ -213,7 +227,12 @@ def find_stable_segment(
     stable_end = best_end
     current = stable_end - window_size
 
-    while current + 2 * window_size <= total_samples:
+    max_extension = min(
+        total_samples,
+        max(window_size, int(round(max_stable_duration * sample_rate))),
+    )
+
+    while current + 2 * window_size <= min(total_samples, max_extension):
         mean1 = window_mean(current)
         next_start = current + window_size
         mean2 = window_mean(next_start)
@@ -224,6 +243,9 @@ def find_stable_segment(
             current = next_start
         else:
             break
+
+    if stable_end > max_extension:
+        stable_end = max_extension
 
     if stable_end - stable_start < min_samples:
         fallback_end = min(total_samples, max(min_samples, window_size))
@@ -236,6 +258,13 @@ def find_stable_segment(
     return refined_weight, stable_start, stable_end
 
 
+def _window_slopes(window: Sequence[float], sample_rate: float) -> Sequence[float]:
+    if len(window) < 2:
+        return ()
+    scale = sample_rate
+    return [(second - first) * scale for first, second in zip(window[:-1], window[1:])]
+
+
 def find_movement_start(
     forces: Sequence[float],
     weight: float,
@@ -244,16 +273,45 @@ def find_movement_start(
     sample_rate: float,
     rel_dev: float,
     k_dev: float,
+    rel_slope: float = 0.003,
+    k_slope: float = 3.0,
     min_duration: float = 0.03,
 ) -> int:
     threshold = max(weight * rel_dev, noise_floor * k_dev)
+    slope_threshold = max(weight * rel_slope * sample_rate, noise_floor * k_slope * sample_rate)
     consecutive = max(1, int(round(sample_rate * min_duration)))
     total_samples = len(forces)
     limit = total_samples - consecutive + 1
+    if limit <= start_index:
+        limit = max(start_index + 1, total_samples)
+
+    def satisfies(idx: int, amp_threshold: float, slope_limit: float) -> bool:
+        window = forces[idx : idx + consecutive]
+        if len(window) < consecutive:
+            return False
+        if not all(abs(value - weight) >= amp_threshold for value in window):
+            return False
+        slopes = _window_slopes(window, sample_rate)
+        return any(abs(slope) >= slope_limit for slope in slopes)
+
+    for idx in range(start_index, limit):
+        if satisfies(idx, threshold, slope_threshold):
+            return idx
+
+    relaxed_threshold = threshold * 0.8
+    relaxed_slope = slope_threshold * 0.8
+    for idx in range(start_index, limit):
+        if satisfies(idx, relaxed_threshold, relaxed_slope):
+            return idx
+
     for idx in range(start_index, limit):
         window = forces[idx : idx + consecutive]
-        if all(abs(value - weight) >= threshold for value in window):
+        if len(window) < consecutive:
+            continue
+        avg_deviation = statistics.fmean(abs(value - weight) for value in window)
+        if avg_deviation >= relaxed_threshold:
             return idx
+
     raise JumpAnalysisError("Unable to detect movement start")
 
 
