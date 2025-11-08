@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import math
 import os
 import statistics
 import sys
@@ -88,73 +87,70 @@ def read_force_signal(path: Path) -> Tuple[str, List[float]]:
 def find_stable_segment(
     forces: Sequence[float],
     sample_rate: float,
-    window_duration: float = 0.25,
-    cv_threshold: float = 0.05,
+    min_duration: float = 0.2,
+    std_ratio: float = 0.025,
+    std_absolute: float = 8.0,
     extend_ratio: float = 0.04,
     extend_absolute: float = 15.0,
-    search_duration: float = 3.0,
+    search_duration: float = 0.3,
 ) -> Tuple[float, int, int]:
     """Locate the initial quiet stance used to estimate body weight.
 
-    The function searches the signal for the first low-variance window and then
-    extends it forwards while the force stays close to the estimated body
-    weight.  The returned ``stable_end`` index is exclusive so it can be used
-    directly as the start of the movement phase.
+    The function searches the first 0.3 seconds of data for the earliest
+    low-variance window that lasts at least 0.2 seconds, then extends it while
+    the force stays close to the estimated body weight.  The returned
+    ``stable_end`` index is exclusive so it can be used directly as the start of
+    the movement phase.
     """
 
-    window_size = max(1, int(round(window_duration * sample_rate)))
+    window_size = max(1, int(round(min_duration * sample_rate)))
     total_samples = len(forces)
     if total_samples < window_size:
         raise JumpAnalysisError("Signal too short to locate a stable stance")
 
-    search_samples = min(total_samples, int(round(search_duration * sample_rate)))
+    search_samples = min(
+        total_samples, max(window_size, int(round(search_duration * sample_rate)))
+    )
     if search_samples < window_size:
         search_samples = window_size
 
-    initial_segment = forces[:search_samples]
-    if not initial_segment:
+    baseline_segment = forces[:search_samples]
+    if not baseline_segment:
         raise JumpAnalysisError("Unable to determine stable stance")
 
-    median = statistics.median(initial_segment)
-    band = max(median * 0.08, extend_absolute * 2)
-    filtered = [value for value in initial_segment if abs(value - median) <= band]
-    if not filtered:
-        filtered = initial_segment
-    weight_estimate = statistics.fmean(filtered)
+    baseline_mean = statistics.fmean(baseline_segment)
 
-    tolerance = max(weight_estimate * extend_ratio, extend_absolute)
-
-    running_sum = 0.0
-    running_sq_sum = 0.0
-    stable_start: Optional[int] = None
-    for idx in range(search_samples):
-        value = forces[idx]
-        running_sum += value
-        running_sq_sum += value * value
-        if idx >= window_size:
-            removed = forces[idx - window_size]
-            running_sum -= removed
-            running_sq_sum -= removed * removed
-        if idx + 1 < window_size:
-            continue
+    best_start: Optional[int] = None
+    running_sum = sum(forces[:window_size])
+    running_sq_sum = sum(value * value for value in forces[:window_size])
+    for start in range(0, search_samples - window_size + 1):
         mean = running_sum / window_size
+        std_threshold = max(std_ratio * abs(mean), std_absolute)
+        std_threshold = max(std_threshold, 0.5)
+        variance_threshold = std_threshold * std_threshold
         variance = max(running_sq_sum / window_size - mean * mean, 0.0)
-        std = math.sqrt(variance)
-        cv = std / mean if mean else math.inf
-        if abs(mean - weight_estimate) <= tolerance and cv <= cv_threshold:
-            stable_start = idx - window_size + 1
+        if variance <= variance_threshold:
+            best_start = start
             break
+        if start + window_size >= search_samples:
+            continue
+        outgoing = forces[start]
+        incoming = forces[start + window_size]
+        running_sum += incoming - outgoing
+        running_sq_sum += incoming * incoming - outgoing * outgoing
 
-    if stable_start is None:
-        stable_start = 0
+    if best_start is None:
+        raise JumpAnalysisError("Unable to locate a stable stance window")
 
+    stable_start = best_start
     stable_end = stable_start + window_size
     cumulative_sum = sum(forces[stable_start:stable_end])
     sample_count = window_size
     deviation_limit = max(1, int(round(sample_rate * 0.02)))
     out_of_bounds = 0
     while stable_end < total_samples:
-        current_mean = cumulative_sum / sample_count if sample_count else weight_estimate
+        current_mean = cumulative_sum / sample_count if sample_count else baseline_mean
+        tolerance = max(current_mean * extend_ratio, extend_absolute)
         value = forces[stable_end]
         if abs(value - current_mean) <= tolerance:
             cumulative_sum += value
@@ -170,7 +166,7 @@ def find_stable_segment(
         sample_count += 1
         stable_end += 1
 
-    refined_weight = cumulative_sum / sample_count if sample_count else weight_estimate
+    refined_weight = cumulative_sum / sample_count if sample_count else baseline_mean
 
     return refined_weight, stable_start, stable_end
 
