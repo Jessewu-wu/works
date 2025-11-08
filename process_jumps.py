@@ -84,23 +84,60 @@ def read_force_signal(path: Path) -> Tuple[str, List[float]]:
     return signal_name, values
 
 
+def robust_mean(values: Sequence[float], trim_ratio: float = 0.1) -> float:
+    """Return a trimmed mean for robustness against outliers."""
+
+    data = list(values)
+    if not data:
+        return 0.0
+    if len(data) < 4:
+        return statistics.fmean(data)
+
+    trim = int(len(data) * trim_ratio)
+    if trim == 0:
+        return statistics.fmean(data)
+
+    sorted_data = sorted(data)
+    trimmed = sorted_data[trim:-trim] or sorted_data
+    return statistics.fmean(trimmed)
+
+
+def robust_noise(values: Sequence[float]) -> float:
+    """Estimate noise using the median absolute deviation."""
+
+    data = list(values)
+    if not data:
+        return 0.0
+
+    median = statistics.median(data)
+    deviations = [abs(value - median) for value in data]
+    mad = statistics.median(deviations)
+    if mad == 0.0:
+        return statistics.pstdev(data) or 0.0
+    # Consistent estimator for Gaussian noise.
+    return mad * 1.4826
+
+
 def find_stable_segment(
     forces: Sequence[float],
     sample_rate: float,
     min_duration: float = 0.2,
-    search_duration: float = 0.1,
+    search_duration: float = 0.4,
     window_samples: int = 20,
-    stable_diff: float = 5.0,
-    change_diff: float = 10.0,
+    rel_stable: float = 0.005,
+    rel_change: float = 0.015,
+    k_noise: float = 1.5,
+    k_change: float = 3.0,
 ) -> Tuple[float, int, int]:
     """Locate the initial quiet stance used to estimate body weight.
 
-    A sliding-window scan compares the mean force of back-to-back windows. If
-    the absolute difference between the windows remains below ``stable_diff``
-    (≈5 N), the samples are considered part of the quiet stance. When the
-    difference exceeds ``change_diff`` (≈10 N), the stance phase ends. The
-    returned ``stable_end`` index is exclusive, allowing it to serve directly as
-    the boundary before movement onset.
+    The detector analyses back-to-back window means within an early baseline
+    segment. Differences that stay below a relative fraction of the baseline
+    load (``rel_stable``) or a multiple of the baseline noise (``k_noise``)
+    extend the stance, whereas deviations above ``rel_change``/``k_change``
+    terminate it. The returned ``stable_end`` index is exclusive, allowing it to
+    serve directly as the boundary before movement onset. If no stable run is
+    found, a trimmed mean over the earliest samples is used as a fallback.
     """
 
     total_samples = len(forces)
@@ -115,6 +152,17 @@ def find_stable_segment(
     if search_samples < 2 * window_size:
         raise JumpAnalysisError("Not enough data for sliding window comparison")
 
+    baseline_segment = forces[:search_samples]
+    baseline_mean = abs(robust_mean(baseline_segment)) or max(
+        1.0, abs(statistics.fmean(baseline_segment))
+    )
+    noise_floor = robust_noise(baseline_segment)
+    if noise_floor <= 0.0:
+        noise_floor = max(1e-6, abs(baseline_mean) * 1e-3)
+
+    stable_threshold = max(rel_stable * baseline_mean, k_noise * noise_floor)
+    change_threshold = max(rel_change * baseline_mean, k_change * noise_floor)
+
     prefix = [0.0]
     for value in forces:
         prefix.append(prefix[-1] + value)
@@ -123,20 +171,47 @@ def find_stable_segment(
         end = start + window_size
         return (prefix[end] - prefix[start]) / window_size
 
-    stable_start: Optional[int] = None
-    for start in range(0, search_samples - 2 * window_size + 1):
+    best_start: Optional[int] = None
+    best_end: Optional[int] = None
+    best_length = 0
+    run_start: Optional[int] = None
+    run_end: Optional[int] = None
+
+    for start in range(0, search_samples - 2 * window_size + 1, window_size):
         mean1 = window_mean(start)
         mean2 = window_mean(start + window_size)
-        if abs(mean2 - mean1) <= stable_diff:
-            stable_start = start
-            break
+        diff = abs(mean2 - mean1)
 
-    if stable_start is None:
-        raise JumpAnalysisError("Unable to locate a stable stance window")
+        if diff <= stable_threshold:
+            if run_start is None:
+                run_start = start
+            run_end = start + 2 * window_size
+        else:
+            if run_start is not None and run_end is not None:
+                run_length = run_end - run_start
+                if run_length > best_length:
+                    best_start, best_end = run_start, run_end
+                    best_length = run_length
+            run_start = None
+            run_end = None
+            if diff >= change_threshold and best_start is not None:
+                break
 
-    stable_samples = list(forces[stable_start : stable_start + window_size])
-    stable_end = stable_start + window_size
-    current = stable_start
+    if run_start is not None and run_end is not None:
+        run_length = run_end - run_start
+        if run_length > best_length:
+            best_start, best_end = run_start, run_end
+            best_length = run_length
+
+    if best_start is None or best_end is None:
+        fallback_end = min(total_samples, max(min_samples, window_size))
+        fallback_samples = forces[:fallback_end]
+        fallback_weight = robust_mean(fallback_samples)
+        return fallback_weight, 0, fallback_end
+
+    stable_start = best_start
+    stable_end = best_end
+    current = stable_end - window_size
 
     while current + 2 * window_size <= total_samples:
         mean1 = window_mean(current)
@@ -144,19 +219,19 @@ def find_stable_segment(
         mean2 = window_mean(next_start)
         diff = abs(mean2 - mean1)
 
-        if diff <= change_diff:
-            stable_samples.extend(forces[next_start : next_start + window_size])
+        if diff <= change_threshold:
             stable_end = next_start + window_size
             current = next_start
-            continue
-
-        # diff > change_diff: stance has ended.
-        break
+        else:
+            break
 
     if stable_end - stable_start < min_samples:
-        raise JumpAnalysisError("Stable stance shorter than minimum duration")
+        fallback_end = min(total_samples, max(min_samples, window_size))
+        fallback_samples = forces[:fallback_end]
+        fallback_weight = robust_mean(fallback_samples)
+        return fallback_weight, 0, fallback_end
 
-    refined_weight = statistics.median(stable_samples)
+    refined_weight = robust_mean(forces[stable_start:stable_end])
 
     return refined_weight, stable_start, stable_end
 
@@ -164,13 +239,14 @@ def find_stable_segment(
 def find_movement_start(
     forces: Sequence[float],
     weight: float,
+    noise_floor: float,
     start_index: int,
     sample_rate: float,
-    deviation_ratio: float,
-    absolute_threshold: float,
+    rel_dev: float,
+    k_dev: float,
     min_duration: float = 0.03,
 ) -> int:
-    threshold = max(weight * deviation_ratio, absolute_threshold)
+    threshold = max(weight * rel_dev, noise_floor * k_dev)
     consecutive = max(1, int(round(sample_rate * min_duration)))
     total_samples = len(forces)
     limit = total_samples - consecutive + 1
@@ -210,54 +286,69 @@ def find_takeoff(
     forces: Sequence[float],
     start_index: int,
     weight: float,
+    noise_floor: float,
     sample_rate: float,
-    ratio: float,
-    absolute_threshold: float,
+    rel_ratio: float,
+    k_event: float,
+    min_duration: float = 0.015,
 ) -> int:
-    threshold = max(weight * ratio, absolute_threshold)
-    return _find_transition(forces, start_index, threshold, sample_rate, "below")
+    threshold = max(weight * rel_ratio, noise_floor * k_event)
+    return _find_transition(
+        forces, start_index, threshold, sample_rate, "below", min_duration=min_duration
+    )
 
 
 def find_landing(
     forces: Sequence[float],
     start_index: int,
     weight: float,
+    noise_floor: float,
     sample_rate: float,
-    ratio: float,
-    absolute_threshold: float,
+    rel_ratio: float,
+    k_event: float,
+    min_duration: float = 0.015,
 ) -> int:
-    threshold = max(weight * ratio, absolute_threshold)
-    return _find_transition(forces, start_index, threshold, sample_rate, "greater")
+    threshold = max(weight * rel_ratio, noise_floor * k_event)
+    return _find_transition(
+        forces, start_index, threshold, sample_rate, "greater", min_duration=min_duration
+    )
 
 
 def detect_jump_phases(forces: Sequence[float], sample_rate: float) -> JumpPhases:
     weight, stable_start, stable_end = find_stable_segment(forces, sample_rate)
     mass = weight / G
+    stable_segment = forces[stable_start:stable_end] or forces[: max(1, int(sample_rate * 0.1))]
+    noise_floor = robust_noise(stable_segment)
+    if noise_floor <= 0.0:
+        noise_floor = max(1e-6, abs(weight) * 1e-3)
     movement_start = find_movement_start(
         forces,
         weight,
+        noise_floor,
         stable_end,
         sample_rate,
-        deviation_ratio=0.03,
-        absolute_threshold=12.0,
+        rel_dev=0.025,
+        k_dev=4.0,
     )
 
     takeoff = find_takeoff(
         forces,
         movement_start,
         weight,
+        noise_floor,
         sample_rate,
-        ratio=0.05,
-        absolute_threshold=20.0,
+        rel_ratio=0.05,
+        k_event=5.0,
     )
 
     landing = find_landing(
         forces,
         takeoff,
         weight,
+        noise_floor,
         sample_rate,
-        ratio=0.05,
-        absolute_threshold=20.0,
+        rel_ratio=0.05,
+        k_event=5.0,
     )
 
     if landing <= takeoff:
